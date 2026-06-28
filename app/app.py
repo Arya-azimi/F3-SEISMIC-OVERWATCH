@@ -5,7 +5,7 @@ import plotly.graph_objs as go
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-import joblib
+from sklearn.preprocessing import StandardScaler
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
 
@@ -95,14 +95,21 @@ app.index_string = '''
 
 try:
     model = tf.keras.models.load_model('../models/dl_forecast_model.keras')
-    scaler = joblib.load('../models/data_scaler.pkl')
     df = pd.read_csv('../outputs/processed_features.csv')
+
+    scaler = StandardScaler()
+    feature_cols = [col for col in df.columns if col not in ['timestamp', 'target']]
+    scaler.fit(df[feature_cols].values)
+
+    non_zero_indices = df.index[df['target'] != 0].tolist()
+    START_INDEX = non_zero_indices[0] if non_zero_indices else 0
 except Exception:
-    dates = pd.date_range(start='2026-06-01', periods=2000, freq='S')
+    dates = pd.date_range(start='2026-06-01', periods=2000, freq='s')
     simulated_signal = np.sin(np.linspace(0, 100, 2000)) + np.random.normal(0, 0.1, 2000)
     df = pd.DataFrame({'timestamp': dates, 'feature_1': np.random.randn(2000), 'target': simulated_signal})
     model = None
     scaler = None
+    START_INDEX = 0
 
 app.layout = dbc.Container([
     dbc.Row([
@@ -129,8 +136,8 @@ app.layout = dbc.Container([
     dbc.Row([
         dbc.Col(html.Div([
             dcc.Graph(id='live-forecast-graph', config={'displayModeBar': False}),
-            dcc.Interval(id='stream-interval', interval=500, n_intervals=0, disabled=True),
-            dcc.Store(id='stream-state', data={'index': 0, 'playing': False})
+            dcc.Interval(id='stream-interval', interval=200, n_intervals=0, disabled=True),
+            dcc.Store(id='stream-state', data={'index': START_INDEX, 'playing': False})
         ], className="glass-card"), width=8),
         dbc.Col(html.Div([
             dcc.Graph(id='distribution-graph', config={'displayModeBar': False})
@@ -144,6 +151,7 @@ app.layout = dbc.Container([
         ], className="glass-card d-flex justify-content-center"), width=12)
     ])
 ], fluid=True, style={'padding': '2rem', 'maxWidth': '1600px'})
+
 
 @app.callback(
     Output('stream-state', 'data'),
@@ -169,21 +177,22 @@ def manage_stream_state(play, pause, reset, n_intervals, state):
     elif trigger_id == 'btn-pause':
         state['playing'] = False
     elif trigger_id == 'btn-reset':
-        state['index'] = 0
+        state['index'] = START_INDEX
         state['playing'] = False
     elif trigger_id == 'stream-interval' and state['playing']:
         state['index'] += 1
         if state['index'] >= len(df):
-            state['index'] = 0
+            state['index'] = START_INDEX
 
     status_text = "STREAMING" if state['playing'] else "PAUSED"
     status_color = {"color": "#00ffcc"} if state['playing'] else {"color": "#ffea00"}
 
-    if state['index'] == 0 and not state['playing']:
+    if state['index'] == START_INDEX and not state['playing']:
         status_text = "READY"
         status_color = {"color": "#00ffcc"}
 
     return state, not state['playing'], status_text, status_color
+
 
 @app.callback(
     Output('live-forecast-graph', 'figure'),
@@ -197,25 +206,43 @@ def render_telemetry(state):
     idx = state['index']
     window_size = 100
 
+    if idx >= len(df):
+        idx = len(df) - 1
+    if idx < 0:
+        idx = 0
+
     start_idx = max(0, idx - window_size)
-    df_window = df.iloc[start_idx:idx + 1]
+    df_window = df.iloc[start_idx:idx + 1].copy()
 
     fig_main = go.Figure()
     fig_dist = go.Figure()
 
     kpi_current = "STANDBY"
     kpi_forecast = "AWAITING DATA"
-    kpi_delta = "0.000"
+    kpi_delta = "0.0000"
 
     if not df_window.empty:
-        x_axis = df_window['timestamp'] if 'timestamp' in df_window.columns else df_window.index
-        y_axis = df_window['target'] if 'target' in df_window.columns else df_window.iloc[:, 0]
+        if 'timestamp' in df_window.columns:
+            x_axis = pd.to_datetime(df_window['timestamp'], errors='coerce').ffill().bfill()
+        else:
+            x_axis = df_window.index
 
-        curr_val = y_axis.iloc[-1]
+        if 'target' in df_window.columns:
+            y_axis = pd.to_numeric(df_window['target'], errors='coerce')
+        else:
+            numeric_cols = df_window.select_dtypes(include='number').columns
+            if len(numeric_cols) > 0:
+                y_axis = pd.to_numeric(df_window[numeric_cols[-1]], errors='coerce')
+            else:
+                y_axis = pd.Series([0.0] * len(df_window), index=df_window.index)
+
+        y_axis = y_axis.fillna(0.0)
+
+        curr_val = float(y_axis.iloc[-1])
         kpi_current = f"{curr_val:.4f}"
 
         if len(y_axis) > 1:
-            delta_val = curr_val - y_axis.iloc[-2]
+            delta_val = curr_val - float(y_axis.iloc[-2])
             prefix = "+" if delta_val > 0 else ""
             kpi_delta = f"{prefix}{delta_val:.4f}"
 
@@ -239,15 +266,27 @@ def render_telemetry(state):
 
         if model is not None and scaler is not None and len(df_window) >= 10:
             try:
-                features = df_window.drop(columns=['timestamp', 'target']).values[-10:]
+                exclude_cols = ['timestamp', 'target']
+                feature_cols = [c for c in df_window.columns if c not in exclude_cols]
+
+                features_df = df_window[feature_cols].copy()
+
+                for c in features_df.columns:
+                    features_df[c] = pd.to_numeric(features_df[c], errors='coerce').fillna(0.0)
+
+                features = features_df.values[-10:]
                 features_scaled = scaler.transform(features)
                 pred_input = np.expand_dims(features_scaled, axis=0)
-                forecast_val = model.predict(pred_input, verbose=0)[0][0]
+                forecast_val = float(model.predict(pred_input, verbose=0)[0][0])
 
                 kpi_forecast = f"{forecast_val:.4f}"
 
-                last_time = pd.to_datetime(x_axis.iloc[-1])
-                next_time = last_time + pd.Timedelta(seconds=1)
+                if isinstance(x_axis.iloc[-1], pd.Timestamp):
+                    last_time = x_axis.iloc[-1]
+                    next_time = last_time + pd.Timedelta(seconds=1)
+                else:
+                    last_time = x_axis.iloc[-1]
+                    next_time = last_time + 1
 
                 fig_main.add_trace(go.Scatter(
                     x=[last_time, next_time],
@@ -285,6 +324,7 @@ def render_telemetry(state):
     )
 
     return fig_main, fig_dist, kpi_current, kpi_forecast, kpi_delta
+
 
 if __name__ == '__main__':
     app.run(debug=False, port=8050)
